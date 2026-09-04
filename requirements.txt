@@ -1,7 +1,6 @@
 streamlit
-pytesseract
-opencv-python-headless
+google-genai
 pillow
 pandas
 openpyxl
-numpy
+
