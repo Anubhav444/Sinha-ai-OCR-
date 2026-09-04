@@ -18,56 +18,59 @@ st.set_page_config(
 st.markdown("""
     <div style="background: linear-gradient(90deg, #0f172a 0%, #1e293b 100%); padding: 18px; border-radius: 10px; margin-bottom: 20px; border-left: 5px solid #38bdf8;">
         <h2 style="color: #ffffff; margin: 0; font-size: 20px;">Sinha AI Tech Solutions</h2>
-        <p style="color: #94a3b8; margin: 4px 0 0 0; font-size: 13px;">Universal Document Digitization & Automated Audit Engine</p>
+        <p style="color: #94a3b8; margin: 4px 0 0 0; font-size: 13px;">Universal Multi-Document Digitization & Contractor Audit Portal</p>
     </div>
 """, unsafe_allow_html=True)
 
-def crop_document_contour(cv_img):
-    # Detect rectangular card if shot against background
-    gray = cv2.cvtColor(cv_img, cv2.COLOR_RGB2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(blurred, 50, 200)
-    
-    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        largest_c = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(largest_c) > (cv_img.shape[0] * cv_img.shape[1] * 0.20):
-            x, y, w, h = cv2.boundingRect(largest_c)
-            return cv_img[y:y+h, x:x+w]
-    return cv_img
-
-def preprocess_camera_image(pil_img):
+def preprocess_card(pil_img):
     img = ImageOps.exif_transpose(pil_img).convert("RGB")
     cv_img = np.array(img)
     
-    # Auto-crop card boundaries if surrounding background exists
-    cv_img = crop_document_contour(cv_img)
-    
+    # Scale appropriately for OCR
     h, w = cv_img.shape[:2]
-    if w > 1600:
-        scaling = 1600.0 / w
-        cv_img = cv2.resize(cv_img, (1600, int(h * scaling)), interpolation=cv2.INTER_AREA)
-    elif w < 900:
-        scaling = 1200.0 / w
-        cv_img = cv2.resize(cv_img, (1200, int(h * scaling)), interpolation=cv2.INTER_CUBIC)
+    if w > 1800:
+        scaling = 1800.0 / w
+        cv_img = cv2.resize(cv_img, (1800, int(h * scaling)), interpolation=cv2.INTER_AREA)
+    elif w < 1000:
+        scaling = 1400.0 / w
+        cv_img = cv2.resize(cv_img, (1400, int(h * scaling)), interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(cv_img, cv2.COLOR_RGB2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    thresh = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 11)
     
-    return thresh, gray
+    # Denoise while keeping character edges sharp
+    denoised = cv2.bilateralFilter(gray, 9, 75, 75)
+    
+    # Contrast enhancement
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    enhanced = clahe.apply(denoised)
+    
+    # Adaptive threshold
+    thresh = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 23, 11)
+    
+    return enhanced, thresh
+
+def clean_name_string(txt):
+    if not txt:
+        return ""
+    # Remove junk characters, keep clean English uppercase words
+    cleaned = re.sub(r"[^A-Za-z\s]", " ", txt)
+    words = [w.strip() for w in cleaned.split() if len(w.strip()) >= 2]
+    # Filter out system and government labels
+    blocklist = ["NAME", "FATHER", "INCOME", "TAX", "GOVT", "INDIA", "DEPARTMENT", "PERMANENT", "ACCOUNT", "NUMBER", "CARD", "SIGNATURE", "DATE", "BIRTH", "MERA", "AADHAAR", "PEHCHAN", "GOVERNMENT", "CITIZENSHIP", "PROOF", "IDENTITY", "UNION", "AUTHORITY"]
+    valid_words = [w for w in words if w.upper() not in blocklist]
+    return " ".join(valid_words).strip()
 
 def extract_universal_data(uploaded_file):
     raw_pil = Image.open(uploaded_file)
-    processed_bin, gray_img = preprocess_camera_image(raw_pil)
+    enhanced_gray, thresh = preprocess_card(raw_pil)
     
-    # Run OCR with character whitelist preference for clean extraction
-    raw_text = pytesseract.image_to_string(gray_img, config='--psm 6')
-    if len(re.sub(r'[^A-Za-z0-9]', '', raw_text)) < 25:
-        raw_text = pytesseract.image_to_string(processed_bin, config='--psm 4')
-
-    lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
+    # Multi-pass text extraction
+    raw_text_gray = pytesseract.image_to_string(enhanced_gray, config='--psm 6')
+    raw_text_thresh = pytesseract.image_to_string(thresh, config='--psm 6')
+    
+    # Combined line stream
+    combined_text = raw_text_gray + "\n" + raw_text_thresh
+    all_lines = [l.strip() for l in combined_text.split("\n") if l.strip()]
 
     name = "Not Detected"
     father = "Not Detected"
@@ -76,84 +79,112 @@ def extract_universal_data(uploaded_file):
     gender = "Not Detected"
     doc_type = "General Document"
 
-    full_text_upper = raw_text.upper()
+    full_upper = combined_text.upper()
 
-    # Classification
-    if "AADHAAR" in full_text_upper or "UNIQUE IDENTIFICATION" in full_text_upper or "MERA AADHAAR" in full_text_upper:
-        doc_type = "Aadhaar Card"
-    elif "PERMANENT ACCOUNT" in full_text_upper or "INCOME TAX" in full_text_upper or re.search(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b", raw_text):
+    # Document Classification
+    if "PERMANENT ACCOUNT" in full_upper or "INCOME TAX" in full_upper or re.search(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b", combined_text):
         doc_type = "PAN Card"
-    elif "DRIVING" in full_text_upper or "TRANSPORT" in full_text_upper:
+    elif "AADHAAR" in full_upper or "UNIQUE IDENTIFICATION" in full_upper or "MERA AADHAAR" in full_upper:
+        doc_type = "Aadhaar Card"
+    elif "DRIVING" in full_upper or "TRANSPORT" in full_upper:
         doc_type = "Driving License"
 
-    # ID Parsing
-    if doc_type == "PAN Card" or gov_id == "Not Detected":
-        pan_m = re.search(r"\b([A-Z]{5}[0-9]{4}[A-Z])\b", raw_text)
-        if pan_m:
-            gov_id = pan_m.group(1)
+    # ID Parsing (PAN format: 5 letters + 4 digits + 1 letter)
+    pan_m = re.search(r"\b([A-Z]{5}[0-9]{4}[A-Z])\b", combined_text)
+    if pan_m:
+        gov_id = pan_m.group(1)
+        if doc_type == "General Document":
+            doc_type = "PAN Card"
 
-    if gov_id == "Not Detected" or doc_type == "Aadhaar Card":
-        aadhaar_m = re.search(r"\b([2-9]\d{3}\s\d{4}\s\d{4})\b", raw_text)
+    # Aadhaar number (12 digits)
+    if gov_id == "Not Detected":
+        aadhaar_m = re.search(r"\b([2-9]\d{3}\s\d{4}\s\d{4})\b", combined_text)
         if aadhaar_m:
             gov_id = aadhaar_m.group(1)
+            doc_type = "Aadhaar Card"
+
+    # Fallback general ID
+    if gov_id == "Not Detected":
+        gen_m = re.search(r"(?:ID|No|Roll|Reg)[:\-\s]*([A-Za-z0-9\-/]{6,20})", combined_text, re.IGNORECASE)
+        if gen_m:
+            gov_id = gen_m.group(1).strip()
 
     # DOB Parsing
-    dob_m = re.search(r"\b(\d{2}[/-]\d{2}[/-]\d{4})\b", raw_text)
+    dob_m = re.search(r"\b(\d{2}[/-]\d{2}[/-]\d{4})\b", combined_text)
     if dob_m:
         dob = dob_m.group(1)
 
     # Gender Parsing
-    if re.search(r"\bMALE\b", raw_text, re.IGNORECASE):
-        gender = "FEMALE" if re.search(r"\bFEMALE\b", raw_text, re.IGNORECASE) else "MALE"
+    if re.search(r"\b(MALE|FEMALE)\b", combined_text, re.IGNORECASE):
+        gender = "FEMALE" if re.search(r"\bFEMALE\b", combined_text, re.IGNORECASE) else "MALE"
 
-    # Aadhaar Clean Name Parsing
-    if doc_type == "Aadhaar Card":
-        for i, line in enumerate(lines):
+    # Target Field Extraction by Document Type
+    if doc_type == "PAN Card":
+        # Scanning for lines following Name and Father labels
+        for idx, line in enumerate(all_lines):
+            l_up = line.upper()
+            
+            # Check for Name label
+            if "NAME" in l_up and not any(k in l_up for k in ["FATHER", "CARD", "ACCOUNT", "DEPARTMENT"]):
+                for forward in range(1, 3):
+                    if idx + forward < len(all_lines):
+                        candidate = clean_name_string(all_lines[idx + forward])
+                        if len(candidate.split()) >= 2 and name == "Not Detected":
+                            name = candidate
+                            break
+
+            # Check for Father Name label
+            if "FATHER" in l_up:
+                for forward in range(1, 3):
+                    if idx + forward < len(all_lines):
+                        candidate = clean_name_string(all_lines[idx + forward])
+                        if len(candidate.split()) >= 2 and father == "Not Detected":
+                            father = candidate
+                            break
+
+        # Fallback: scan for any pure 2-3 word uppercase candidate lines
+        if name == "Not Detected" or father == "Not Detected":
+            clean_candidates = []
+            for line in all_lines:
+                cand = clean_name_string(line)
+                words = cand.split()
+                if 2 <= len(words) <= 3 and all(w.isupper() for w in words):
+                    if cand not in clean_candidates:
+                        clean_candidates.append(cand)
+            if name == "Not Detected" and len(clean_candidates) >= 1:
+                name = clean_candidates[0]
+            if father == "Not Detected" and len(clean_candidates) >= 2:
+                father = clean_candidates[1]
+
+    elif doc_type == "Aadhaar Card":
+        # On Aadhaar, the English name appears immediately above the DOB line
+        for idx, line in enumerate(all_lines):
             if any(k in line.upper() for k in ["DOB", "YEAR OF BIRTH"]):
-                if i >= 1:
-                    cand = re.sub(r"[^A-Za-z\s]", "", lines[i-1]).strip()
-                    words = [w for w in cand.split() if len(w) > 2]
-                    if len(words) >= 2:
-                        name = " ".join(words)
+                for back in range(1, 3):
+                    if idx - back >= 0:
+                        cand = clean_name_string(all_lines[idx - back])
+                        words = cand.split()
+                        if len(words) >= 2:
+                            name = cand
+                            break
                 break
 
-    # PAN Specific Precision Name Extractor
-    # Matches exclusively strict 2 to 4 word uppercase names and ignores noise strings
-    if doc_type == "PAN Card":
-        candidate_names = []
-        noise_keywords = ["INCOME", "TAX", "GOVT", "INDIA", "DEPARTMENT", "PERMANENT", "ACCOUNT", "NUMBER", "CARD", "SIGNATURE", "DATE", "BIRTH"]
-        
-        for l in lines:
-            # Strip non-alpha characters
-            clean_l = re.sub(r"[^A-Za-z\s]", "", l).strip()
-            words = clean_l.split()
-            # Indian names on PAN: 2 to 4 words, strictly uppercase, each word length >= 3
-            if 2 <= len(words) <= 4:
-                if all(w.isupper() and len(w) >= 3 for w in words):
-                    if not any(k in clean_l.upper() for k in noise_keywords):
-                        candidate_names.append(" ".join(words))
-
-        if len(candidate_names) >= 1:
-            name = candidate_names[0]
-        if len(candidate_names) >= 2:
-            father = candidate_names[1]
-
-    # Generic Fallback
+    # General fallback for any labeled application forms
     if name == "Not Detected":
-        for line in lines:
-            if re.search(r"(?:Candidate|Citizen|Name)\s*[:\-]", line, re.IGNORECASE):
+        for line in all_lines:
+            if re.search(r"(?:Candidate|Citizen|Applicant|Name)\s*[:\-]", line, re.IGNORECASE):
                 parts = re.split(r"[:\-]", line, maxsplit=1)
                 if len(parts) > 1:
-                    clean_val = re.sub(r"[^A-Za-z\s]", "", parts[1]).strip()
-                    words = [w for w in clean_val.split() if len(w) > 2]
-                    if len(words) >= 2 and "FATHER" not in clean_val.upper():
-                        name = " ".join(words)
+                    cand = clean_name_string(parts[1])
+                    if len(cand.split()) >= 2:
+                        name = cand
                         break
 
     score = sum([
         1 if name != "Not Detected" else 0,
         1 if gov_id != "Not Detected" else 0,
-        1 if dob != "Not Detected" else 0
+        1 if dob != "Not Detected" else 0,
+        1 if father != "Not Detected" else 0
     ])
 
     status = "Verified" if score >= 2 else "Needs Review"
@@ -169,7 +200,7 @@ def extract_universal_data(uploaded_file):
         "Audit Status": status
     }
 
-st.subheader("📂 Upload Documents (Aadhaar / PAN / Forms)")
+st.subheader("📂 Upload Documents (Aadhaar / PAN / Official Forms)")
 uploaded_files = st.file_uploader(
     "Select Documents (JPG, PNG)",
     type=["jpg", "png", "jpeg"],
@@ -200,5 +231,5 @@ if uploaded_files:
             data=output_buffer.getvalue(),
             file_name=f"Sinha_AI_Extract_{time_stamp}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-        
+    )
+                                                 
