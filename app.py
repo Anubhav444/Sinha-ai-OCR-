@@ -22,15 +22,32 @@ st.markdown("""
     </div>
 """, unsafe_allow_html=True)
 
+def crop_document_contour(cv_img):
+    # Detect rectangular card if shot against background
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(blurred, 50, 200)
+    
+    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest_c = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest_c) > (cv_img.shape[0] * cv_img.shape[1] * 0.20):
+            x, y, w, h = cv2.boundingRect(largest_c)
+            return cv_img[y:y+h, x:x+w]
+    return cv_img
+
 def preprocess_camera_image(pil_img):
     img = ImageOps.exif_transpose(pil_img).convert("RGB")
     cv_img = np.array(img)
+    
+    # Auto-crop card boundaries if surrounding background exists
+    cv_img = crop_document_contour(cv_img)
     
     h, w = cv_img.shape[:2]
     if w > 1600:
         scaling = 1600.0 / w
         cv_img = cv2.resize(cv_img, (1600, int(h * scaling)), interpolation=cv2.INTER_AREA)
-    elif w < 800:
+    elif w < 900:
         scaling = 1200.0 / w
         cv_img = cv2.resize(cv_img, (1200, int(h * scaling)), interpolation=cv2.INTER_CUBIC)
 
@@ -45,7 +62,7 @@ def extract_universal_data(uploaded_file):
     raw_pil = Image.open(uploaded_file)
     processed_bin, gray_img = preprocess_camera_image(raw_pil)
     
-    # Dual-pass OCR
+    # Run OCR with character whitelist preference for clean extraction
     raw_text = pytesseract.image_to_string(gray_img, config='--psm 6')
     if len(re.sub(r'[^A-Za-z0-9]', '', raw_text)) < 25:
         raw_text = pytesseract.image_to_string(processed_bin, config='--psm 4')
@@ -61,8 +78,8 @@ def extract_universal_data(uploaded_file):
 
     full_text_upper = raw_text.upper()
 
-    # Document Classification
-    if "AADHAAR" in full_text_upper or "UNIQUE IDENTIFICATION" in full_text_upper or "GOVERNMENT OF INDIA" in full_text_upper:
+    # Classification
+    if "AADHAAR" in full_text_upper or "UNIQUE IDENTIFICATION" in full_text_upper or "MERA AADHAAR" in full_text_upper:
         doc_type = "Aadhaar Card"
     elif "PERMANENT ACCOUNT" in full_text_upper or "INCOME TAX" in full_text_upper or re.search(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b", raw_text):
         doc_type = "PAN Card"
@@ -89,52 +106,48 @@ def extract_universal_data(uploaded_file):
     if re.search(r"\bMALE\b", raw_text, re.IGNORECASE):
         gender = "FEMALE" if re.search(r"\bFEMALE\b", raw_text, re.IGNORECASE) else "MALE"
 
-    # Aadhaar Name Parsing
+    # Aadhaar Clean Name Parsing
     if doc_type == "Aadhaar Card":
         for i, line in enumerate(lines):
             if any(k in line.upper() for k in ["DOB", "YEAR OF BIRTH"]):
                 if i >= 1:
                     cand = re.sub(r"[^A-Za-z\s]", "", lines[i-1]).strip()
-                    words = cand.split()
-                    clean_words = [w for w in words if len(w) > 2 or w.upper() in ["OM", "AL"]]
-                    if len(clean_words) >= 1:
-                        cand = " ".join(clean_words)
-                    if len(cand) > 3 and not any(w in cand.upper() for w in ["INDIA", "GOVERNMENT", "AADHAAR"]):
-                        name = cand
+                    words = [w for w in cand.split() if len(w) > 2]
+                    if len(words) >= 2:
+                        name = " ".join(words)
                 break
 
-    # PAN Specific Parsing
+    # PAN Specific Precision Name Extractor
+    # Matches exclusively strict 2 to 4 word uppercase names and ignores noise strings
     if doc_type == "PAN Card":
-        for i, line in enumerate(lines):
-            if re.search(r"(?:Name|नाम)\b", line, re.IGNORECASE) and not re.search(r"(?:Father|Department|Card|Account)", line, re.IGNORECASE):
-                cand_val = re.sub(r"(?:Name|नाम|[:\-])", "", line, flags=re.IGNORECASE).strip()
-                cand_val = re.sub(r"[^A-Za-z\s]", "", cand_val).strip()
-                if len(cand_val) > 3:
-                    name = cand_val
-                elif i + 1 < len(lines):
-                    next_cand = re.sub(r"[^A-Za-z\s]", "", lines[i+1]).strip()
-                    if len(next_cand) > 3 and next_cand.isupper():
-                        name = next_cand
+        candidate_names = []
+        noise_keywords = ["INCOME", "TAX", "GOVT", "INDIA", "DEPARTMENT", "PERMANENT", "ACCOUNT", "NUMBER", "CARD", "SIGNATURE", "DATE", "BIRTH"]
+        
+        for l in lines:
+            # Strip non-alpha characters
+            clean_l = re.sub(r"[^A-Za-z\s]", "", l).strip()
+            words = clean_l.split()
+            # Indian names on PAN: 2 to 4 words, strictly uppercase, each word length >= 3
+            if 2 <= len(words) <= 4:
+                if all(w.isupper() and len(w) >= 3 for w in words):
+                    if not any(k in clean_l.upper() for k in noise_keywords):
+                        candidate_names.append(" ".join(words))
 
-            if re.search(r"(?:Father|पिता)\b", line, re.IGNORECASE):
-                f_val = re.sub(r"(?:Father|Name|नाम|पिता|[:\-])", "", line, flags=re.IGNORECASE).strip()
-                f_val = re.sub(r"[^A-Za-z\s]", "", f_val).strip()
-                if len(f_val) > 3:
-                    father = f_val
-                elif i + 1 < len(lines):
-                    next_f = re.sub(r"[^A-Za-z\s]", "", lines[i+1]).strip()
-                    if len(next_f) > 3 and next_f.isupper():
-                        father = next_f
+        if len(candidate_names) >= 1:
+            name = candidate_names[0]
+        if len(candidate_names) >= 2:
+            father = candidate_names[1]
 
-    # Generic Fallback for Other Forms
+    # Generic Fallback
     if name == "Not Detected":
         for line in lines:
             if re.search(r"(?:Candidate|Citizen|Name)\s*[:\-]", line, re.IGNORECASE):
                 parts = re.split(r"[:\-]", line, maxsplit=1)
                 if len(parts) > 1:
                     clean_val = re.sub(r"[^A-Za-z\s]", "", parts[1]).strip()
-                    if len(clean_val) > 2 and "FATHER" not in clean_val.upper():
-                        name = clean_val
+                    words = [w for w in clean_val.split() if len(w) > 2]
+                    if len(words) >= 2 and "FATHER" not in clean_val.upper():
+                        name = " ".join(words)
                         break
 
     score = sum([
@@ -187,5 +200,5 @@ if uploaded_files:
             data=output_buffer.getvalue(),
             file_name=f"Sinha_AI_Extract_{time_stamp}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+        )
         
